@@ -73,7 +73,6 @@ The data were generated with the **Curio Seeker 3×3** platform: a bead-based sp
 | Stroma / fibroblast | *Dcn*, *Col1a1*, *Pdgfra* |
 | Smooth muscle | *Acta2*, *Tagln* |
 | Endothelial | *Pecam1*, *Cdh5* |
-| Atretic (apoptotic) | *Casp3*, *Fas*, *Inhbb* |
 
 **Platform context — Curio Seeker 3×3 vs. alternatives:**
 
@@ -567,8 +566,7 @@ cell_markers <- list(
   Theca           = c("Cyp17a1", "Star", "Lhcgr", "Insl3"),
   Stroma          = c("Dcn", "Col1a1", "Pdgfra", "Vim"),
   SmoothMuscle    = c("Acta2", "Tagln", "Myl9"),
-  Endothelial     = c("Pecam1", "Cdh5", "Vegfa"),
-  Atretic         = c("Casp3", "Fas", "Inhbb", "Bnip3")   # apoptotic / atretic follicle cells
+  Endothelial     = c("Pecam1", "Cdh5", "Vegfa")
 )
 
 # Filter to genes present in our dataset
@@ -625,7 +623,6 @@ cluster_annotation <- c(
   "6" = "SmoothMuscle",
   "7" = "Endothelial",
   "8" = "Stroma"
-  # Add "9" = "Atretic" etc. based on DotPlot above — look for Casp3/Fas co-expression
 )
 
 current_clusters <- as.character(Idents(obj))
