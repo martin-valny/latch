@@ -32,14 +32,14 @@ Run this block once to install all required packages before knitting.
 ```{r install-packages, eval=FALSE}
 # ── Run once to install dependencies ─────────────────────────────────────────
 install.packages(c(
-  "Seurat", "SeuratObject", "hdf5r",
+  "Seurat", "SeuratObject",
   "ggplot2", "patchwork", "dplyr",
   "Matrix", "knitr", "rmarkdown"
 ))
 
-# SeuratDisk (not on CRAN — install from GitHub)
-if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
-remotes::install_github("mojaveazure/seurat-disk")
+# rhdf5 — Bioconductor HDF5 reader (avoids hdf5r compilation issues)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("rhdf5")
 ```
 
 ```{r libraries}
@@ -48,7 +48,7 @@ library(ggplot2)
 library(patchwork)
 library(dplyr)
 library(Matrix)
-library(hdf5r)
+library(rhdf5)   # Bioconductor HDF5 reader; install via BiocManager::install("rhdf5")
 
 set.seed(42)
 ```
@@ -100,13 +100,12 @@ H5_PATH <- "data/sample.h5ad"   # <-- change if needed
 ```
 
 ```{r load-h5ad}
-# The .h5ad (AnnData) format is HDF5-based. We read it directly with hdf5r,
-# extracting the count matrix, bead barcodes, gene names, and spatial coords.
-
-h5 <- H5File$new(H5_PATH, mode = "r")
+# The .h5ad (AnnData) format is HDF5-based. We inspect it with rhdf5::h5ls(),
+# which lists all groups and datasets without opening a persistent file handle.
 
 cat("Top-level keys in .h5ad:\n")
-print(h5$ls()$name)
+top_keys <- h5ls(H5_PATH, recursive = FALSE)
+print(top_keys$name)
 ```
 
 ```{r parse-counts}
@@ -114,23 +113,33 @@ print(h5$ls()$name)
 # AnnData stores the matrix in /X. It can be dense (2D dataset) or sparse
 # (a group with /X/data, /X/indices, /X/indptr following CSR format).
 
-obs_names <- h5[["obs/_index"]][]   # bead barcodes  (rows in AnnData)
-var_names <- h5[["var/_index"]][]   # gene names     (cols in AnnData)
+obs_names <- h5read(H5_PATH, "/obs/_index")   # bead barcodes  (rows in AnnData)
+var_names <- h5read(H5_PATH, "/var/_index")   # gene names     (cols in AnnData)
 
-x_keys <- tryCatch(h5[["X"]]$ls()$name, error = function(e) NULL)
+# Determine whether /X is sparse (group with data/indices/indptr) or dense
+x_contents <- tryCatch(
+  h5ls(H5_PATH, recursive = FALSE) |>
+    (\(d) h5ls(H5_PATH)[grepl("^/X$", paste0(h5ls(H5_PATH)$group, "/", h5ls(H5_PATH)$name) |>
+                                gsub("/X/.*", "/X", x = _)), ])(),
+  error = function(e) NULL
+)
+x_subkeys <- tryCatch(
+  { xl <- h5ls(H5_PATH); xl$name[xl$group == "/X"] },
+  error = function(e) character(0)
+)
 
-if (!is.null(x_keys) && all(c("data", "indices", "indptr") %in% x_keys)) {
+if (all(c("data", "indices", "indptr") %in% x_subkeys)) {
   # Sparse CSR matrix
   cat("Sparse CSR matrix detected\n")
-  sp_data    <- h5[["X/data"]][]
-  sp_indices <- h5[["X/indices"]][]
-  sp_indptr  <- h5[["X/indptr"]][]
+  sp_data    <- h5read(H5_PATH, "/X/data")
+  sp_indices <- h5read(H5_PATH, "/X/indices")
+  sp_indptr  <- h5read(H5_PATH, "/X/indptr")
   n_obs <- length(obs_names)
   n_var <- length(var_names)
   # AnnData CSR: rows = obs (beads), cols = var (genes)
   # Seurat expects genes × beads, so we build transposed
   counts_sparse <- sparseMatrix(
-    i    = sp_indices + 1L,   # 0-indexed → 1-indexed (column indices in CSR = gene indices)
+    i    = sp_indices + 1L,   # 0-indexed → 1-indexed
     p    = sp_indptr,
     x    = as.numeric(sp_data),
     dims = c(n_var, n_obs),
@@ -139,7 +148,7 @@ if (!is.null(x_keys) && all(c("data", "indices", "indptr") %in% x_keys)) {
 } else {
   # Dense matrix — AnnData shape is (n_obs × n_var)
   cat("Dense matrix detected\n")
-  mat_raw <- h5[["X"]][]
+  mat_raw <- h5read(H5_PATH, "/X")
   counts_sparse <- Matrix(t(mat_raw), sparse = TRUE)
   rownames(counts_sparse) <- var_names
   colnames(counts_sparse) <- obs_names
@@ -153,12 +162,12 @@ cat(sprintf("Matrix: %d genes × %d beads\n", nrow(counts_sparse), ncol(counts_s
 # Curio Seeker stores bead XY positions in obsm/spatial (shape: n_obs × 2).
 
 spatial_coords <- tryCatch({
-  raw <- h5[["obsm/spatial"]][]
-  # hdf5r reads a (2 × n_obs) or (n_obs × 2) array depending on storage order
-  if (ncol(raw) == 2) {
-    df <- as.data.frame(raw)
-  } else {
+  raw <- h5read(H5_PATH, "/obsm/spatial")
+  # rhdf5 reads HDF5 arrays in column-major order; result may be (2 × n_obs)
+  if (nrow(raw) == 2) {
     df <- as.data.frame(t(raw))
+  } else {
+    df <- as.data.frame(raw)
   }
   colnames(df) <- c("x", "y")
   rownames(df) <- obs_names
@@ -168,8 +177,6 @@ spatial_coords <- tryCatch({
   cat("No spatial coordinates found — proceeding without spatial plots.\n")
   NULL
 })
-
-h5$close_all()
 ```
 
 ```{r create-seurat}
