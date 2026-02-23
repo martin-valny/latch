@@ -1,0 +1,677 @@
+---
+title: "Mouse Ovary Spatial Transcriptomics: End-to-End Analysis"
+subtitle: "Curio Seeker 3×3 | Single Sample | Latch Bio Take-Home"
+author: "Martin Valny"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+    code_folding: show
+    fig_width: 9
+    fig_height: 6
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+## Package Installation
+
+Run this block once to install all required packages before knitting.
+
+```{r install-packages, eval=FALSE}
+# ── Run once to install dependencies ─────────────────────────────────────────
+install.packages(c(
+  "Seurat", "SeuratObject", "hdf5r",
+  "ggplot2", "patchwork", "dplyr",
+  "Matrix", "knitr", "rmarkdown"
+))
+
+# SeuratDisk (not on CRAN — install from GitHub)
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+remotes::install_github("mojaveazure/seurat-disk")
+```
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(Matrix)
+library(hdf5r)
+
+set.seed(42)
+```
+
+## Background
+
+This notebook performs an end-to-end analysis of a single ovary sample from:
+
+> **"A spatiotemporal molecular atlas of the ovulating mouse ovary"**
+> Woad *et al.*, *PNAS* 2024. <https://www.pnas.org/doi/10.1073/pnas.2317418121>
+
+The data were generated with the **Curio Seeker 3×3** platform: a bead-based spatial transcriptomics assay capturing mRNA from a 3 mm × 3 mm tissue section onto ~80,000 spatially-indexed beads at 10 µm resolution (~1–2 cells per bead).
+
+**Expected major cell types:**
+
+| Cell type | Key markers |
+|---|---|
+| Oocyte | *Gdf9*, *Zp3*, *Nobox*, *Figla* |
+| Granulosa — mural | *Foxl2*, *Cyp19a1*, *Amh*, *Inha* |
+| Granulosa — cumulus | *Ptx3*, *Has2*, *Ptger2* |
+| Theca | *Cyp17a1*, *Star*, *Lhcgr* |
+| Stroma / fibroblast | *Dcn*, *Col1a1*, *Pdgfra* |
+| Smooth muscle | *Acta2*, *Tagln* |
+| Endothelial | *Pecam1*, *Cdh5* |
+
+---
+
+## Data Loading
+
+```{r config}
+# ── Set this to your local path of the downloaded .h5ad file ─────────────────
+H5_PATH <- "data/sample.h5ad"   # <-- change if needed
+```
+
+```{r load-h5ad}
+# The .h5ad (AnnData) format is HDF5-based. We read it directly with hdf5r,
+# extracting the count matrix, bead barcodes, gene names, and spatial coords.
+
+h5 <- H5File$new(H5_PATH, mode = "r")
+
+cat("Top-level keys in .h5ad:\n")
+print(h5$ls()$name)
+```
+
+```{r parse-counts}
+# ── Count matrix ──────────────────────────────────────────────────────────────
+# AnnData stores the matrix in /X. It can be dense (2D dataset) or sparse
+# (a group with /X/data, /X/indices, /X/indptr following CSR format).
+
+obs_names <- h5[["obs/_index"]][]   # bead barcodes  (rows in AnnData)
+var_names <- h5[["var/_index"]][]   # gene names     (cols in AnnData)
+
+x_keys <- tryCatch(h5[["X"]]$ls()$name, error = function(e) NULL)
+
+if (!is.null(x_keys) && all(c("data", "indices", "indptr") %in% x_keys)) {
+  # Sparse CSR matrix
+  cat("Sparse CSR matrix detected\n")
+  sp_data    <- h5[["X/data"]][]
+  sp_indices <- h5[["X/indices"]][]
+  sp_indptr  <- h5[["X/indptr"]][]
+  n_obs <- length(obs_names)
+  n_var <- length(var_names)
+  # AnnData CSR: rows = obs (beads), cols = var (genes)
+  # Seurat expects genes × beads, so we build transposed
+  counts_sparse <- sparseMatrix(
+    i    = sp_indices + 1L,   # 0-indexed → 1-indexed (column indices in CSR = gene indices)
+    p    = sp_indptr,
+    x    = as.numeric(sp_data),
+    dims = c(n_var, n_obs),
+    dimnames = list(var_names, obs_names)
+  )
+} else {
+  # Dense matrix — AnnData shape is (n_obs × n_var)
+  cat("Dense matrix detected\n")
+  mat_raw <- h5[["X"]][]
+  counts_sparse <- Matrix(t(mat_raw), sparse = TRUE)
+  rownames(counts_sparse) <- var_names
+  colnames(counts_sparse) <- obs_names
+}
+
+cat(sprintf("Matrix: %d genes × %d beads\n", nrow(counts_sparse), ncol(counts_sparse)))
+```
+
+```{r parse-spatial}
+# ── Spatial coordinates ───────────────────────────────────────────────────────
+# Curio Seeker stores bead XY positions in obsm/spatial (shape: n_obs × 2).
+
+spatial_coords <- tryCatch({
+  raw <- h5[["obsm/spatial"]][]
+  # hdf5r reads a (2 × n_obs) or (n_obs × 2) array depending on storage order
+  if (ncol(raw) == 2) {
+    df <- as.data.frame(raw)
+  } else {
+    df <- as.data.frame(t(raw))
+  }
+  colnames(df) <- c("x", "y")
+  rownames(df) <- obs_names
+  cat(sprintf("Spatial coords: %d beads\n", nrow(df)))
+  df
+}, error = function(e) {
+  cat("No spatial coordinates found — proceeding without spatial plots.\n")
+  NULL
+})
+
+h5$close_all()
+```
+
+```{r create-seurat}
+# ── Seurat object ─────────────────────────────────────────────────────────────
+obj <- CreateSeuratObject(
+  counts      = counts_sparse,
+  project     = "OvarySeeker3x3",
+  min.cells   = 3,    # keep genes detected in ≥3 beads
+  min.features = 10   # keep beads expressing ≥10 genes (removes empty beads)
+)
+
+# Store spatial coordinates in metadata
+if (!is.null(spatial_coords)) {
+  shared <- intersect(colnames(obj), rownames(spatial_coords))
+  obj$x_coord <- spatial_coords[shared, "x"]
+  obj$y_coord <- spatial_coords[shared, "y"]
+}
+
+print(obj)
+```
+
+---
+
+## Step 1: Quality Control
+
+QC identifies and removes low-quality beads. For Curio Seeker 3×3 (10 µm beads, 1–2 cells each), three metrics matter:
+
+- **`nFeature_RNA`** — genes detected per bead. Too few → empty bead; too many → bead doublet.
+- **`nCount_RNA`** — total UMIs per bead. Reflects capture efficiency.
+- **`percent.mt`** — mitochondrial gene fraction. High % indicates stressed/dead cells whose cytoplasmic mRNA has leaked, leaving mitochondrially-encoded transcripts over-represented.
+
+Seeker beads typically yield lower gene counts than droplet-based platforms (10x Chromium) because each bead covers ~10 µm vs. a single isolated cell. Thresholds are set accordingly.
+
+```{r qc-calc}
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+
+summary(obj@meta.data[, c("nFeature_RNA", "nCount_RNA", "percent.mt")])
+```
+
+```{r qc-violin, fig.cap="QC metrics across all beads before filtering."}
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3, pt.size = 0
+) & theme(axis.title.x = element_blank())
+```
+
+```{r qc-scatter, fig.cap="Scatter plots to identify outlier beads and set thresholds."}
+p1 <- FeatureScatter(obj, "nCount_RNA", "nFeature_RNA", pt.size = 0.3) + NoLegend()
+p2 <- FeatureScatter(obj, "nCount_RNA", "percent.mt",   pt.size = 0.3) + NoLegend()
+p1 + p2
+```
+
+```{r qc-spatial-map, eval=!is.null(obj$x_coord), fig.cap="Spatial QC: genes per bead and mito fraction mapped onto the tissue."}
+if (!is.null(obj$x_coord)) {
+  meta <- obj@meta.data
+  g1 <- ggplot(meta, aes(x_coord, y_coord, colour = nFeature_RNA)) +
+    geom_point(size = 0.3) + scale_colour_viridis_c(option = "B") +
+    coord_fixed() + theme_void() + labs(title = "Genes / bead")
+  g2 <- ggplot(meta, aes(x_coord, y_coord, colour = percent.mt)) +
+    geom_point(size = 0.3) + scale_colour_viridis_c(option = "A") +
+    coord_fixed() + theme_void() + labs(title = "% Mitochondrial")
+  g1 + g2
+}
+```
+
+```{r qc-filter}
+n_before <- ncol(obj)
+
+obj <- subset(
+  obj,
+  subset = nFeature_RNA  > 200  &
+           nFeature_RNA  < 6000 &
+           nCount_RNA    > 500  &
+           percent.mt    < 20
+)
+
+cat(sprintf("Beads: %d → %d  (%.1f%% removed)\n",
+            n_before, ncol(obj), 100 * (1 - ncol(obj)/n_before)))
+```
+
+---
+
+> **MCQ 1 — Quality Control**
+>
+> A subset of beads shows very high mitochondrial gene fraction (>30%) alongside very low total UMI counts. What is the most likely biological explanation?
+>
+> A) These beads captured oocytes, which naturally express many mitochondrial genes due to their high metabolic activity
+> B) These beads captured damaged or dying cells whose cytoplasmic mRNA has leaked out, leaving primarily mitochondrially-encoded transcripts
+> C) These beads are in the corpus luteum, which is rich in mitochondria for steroidogenesis
+> D) These beads represent theca cells undergoing active androgen biosynthesis
+>
+> **Answer: B** — High mito% combined with low total UMI is the molecular signature of a broken or apoptotic cell. The cell membrane is compromised, cytoplasmic mRNA degrades or leaks, but membrane-bound mitochondria retain their transcripts. This pattern reflects cell damage, not any particular cell type identity.
+
+---
+
+## Step 2: Normalization
+
+Raw UMI counts vary between beads due to capture efficiency, sequencing depth, and cell size — not genuine biology. Normalization removes these technical differences so gene expression values are comparable across beads.
+
+**Method: Log-normalization**
+Each bead's counts are scaled to a common total (10,000 UMI), then log(1+x)-transformed. This compresses the dynamic range and makes the distribution more approximately normal — an assumption of downstream linear methods (PCA, DE tests).
+
+```{r normalize}
+obj <- NormalizeData(
+  obj,
+  normalization.method = "LogNormalize",
+  scale.factor         = 10000
+)
+# Raw counts preserved in obj[["RNA"]]$counts
+# Normalized values in obj[["RNA"]]$data
+cat("Normalization complete.\n")
+```
+
+```{r norm-check, fig.cap="A housekeeping gene (Gapdh) before and after normalization. Normalization reduces correlation between total counts and individual gene expression."}
+gene <- if ("Gapdh" %in% rownames(obj)) "Gapdh" else rownames(obj)[1]
+
+raw_vals  <- obj[["RNA"]]$counts[gene, ]
+norm_vals <- obj[["RNA"]]$data[gene, ]
+
+par(mfrow = c(1, 2))
+hist(raw_vals [raw_vals  > 0], breaks = 40, col = "steelblue", border = NA,
+     main = paste("Raw counts:", gene), xlab = "UMI")
+hist(norm_vals[norm_vals > 0], breaks = 40, col = "coral",     border = NA,
+     main = paste("Normalized:", gene), xlab = "log-norm")
+par(mfrow = c(1, 1))
+```
+
+---
+
+> **MCQ 2 — Normalization**
+>
+> We normalize UMI counts before comparing gene expression across beads. Which statement best captures the PRIMARY biological motivation for this step in ovarian cell typing?
+>
+> A) Normalization removes batch effects introduced during tissue dissection
+> B) Normalization corrects for sequencing depth and mRNA capture differences so that observed gene expression differences reflect true biology, not technical variation
+> C) Normalization sets housekeeping genes to zero, making cell-type markers more prominent
+> D) Normalization converts counts to TPM, which Seurat requires for clustering
+>
+> **Answer: B** — A granulosa bead sequenced to 5,000 UMIs would appear to "express more" of every gene than one sequenced to 1,000 UMIs. Without normalization this technical variation would dominate clustering, grouping beads by sequencing depth rather than cell identity.
+
+---
+
+## Step 3: Feature Selection
+
+The mouse genome has ~20,000 protein-coding genes, but most are either unexpressed or constitutively expressed at similar levels across all cell types. Including these uninformative genes adds noise without helping distinguish oocytes from granulosa cells.
+
+**Method: Variance-stabilizing transformation (VST)**
+VST models the expected relationship between a gene's mean expression and its variance. Genes whose variance exceeds what is expected for their mean are "highly variable" — these capture biological differences between cell types. We retain the top 2,000 HVGs for all downstream steps.
+
+```{r hvg}
+obj <- FindVariableFeatures(
+  obj,
+  selection.method = "vst",
+  nfeatures        = 2000
+)
+
+cat(sprintf("Top 10 HVGs: %s\n",
+            paste(head(VariableFeatures(obj), 10), collapse = ", ")))
+```
+
+```{r hvg-plot, fig.cap="Mean–variance plot. Red points are the 2,000 selected HVGs; top 15 are labeled. Genes above the fitted curve vary more than expected for their expression level."}
+top15 <- head(VariableFeatures(obj), 15)
+p <- VariableFeaturePlot(obj)
+LabelPoints(plot = p, points = top15, repel = TRUE, xnudge = 0, ynudge = 0)
+```
+
+---
+
+> **MCQ 3 — Feature Selection**
+>
+> After selecting ~2,000 highly variable genes from ~20,000, we use only HVGs for all downstream clustering and dimensionality reduction. Why does this improve cell type separation in the ovary dataset?
+>
+> A) Using fewer genes speeds up computation and the result is identical to using all genes
+> B) Most genes are constitutively expressed at similar levels across granulosa, theca, oocyte, and stroma cells; retaining only genes that vary across cell types removes noise and sharpens the transcriptomic signatures that define each lineage
+> C) VST removes mitochondrial genes that would otherwise confound clustering
+> D) Seurat's clustering algorithm requires exactly 2,000 genes as input
+>
+> **Answer: B** — Constitutive housekeeping genes (e.g., ribosomal proteins, metabolic enzymes) are expressed by every cell type. They add variance without biological discriminatory power. HVGs — the genes that differ between an oocyte and a granulosa cell — carry the signal needed to resolve distinct clusters.
+
+---
+
+## Step 4: Dimensionality Reduction
+
+Even 2,000 genes form a high-dimensional space where distances are hard to interpret. Dimensionality reduction compresses this into a low-dimensional summary that preserves the most important structure.
+
+**Two-stage:**
+
+1. **PCA** — linear projection capturing the major axes of transcriptional variation. We use the top PCs (chosen from an elbow plot) as input for graph construction.
+2. **UMAP** — non-linear method that takes the PCA neighbourhood graph as input and produces a 2D visualization preserving local structure.
+
+```{r scale-pca}
+# Scale all HVGs to zero mean / unit variance before PCA
+obj <- ScaleData(obj, features = VariableFeatures(obj))
+
+obj <- RunPCA(obj, features = VariableFeatures(obj), npcs = 50, verbose = FALSE)
+
+# Genes most strongly loading each PC
+print(obj[["pca"]], dims = 1:3, nfeatures = 5)
+```
+
+```{r elbow-plot, fig.cap="Elbow plot: standard deviation explained by each PC. The dashed line marks the chosen cutoff where the curve begins to flatten."}
+ElbowPlot(obj, ndims = 50) +
+  geom_vline(xintercept = 20, linetype = "dashed", colour = "firebrick") +
+  annotate("text", x = 22, y = max(obj[["pca"]]@stdev) * 0.8,
+           label = "PC cutoff = 20", colour = "firebrick", hjust = 0)
+```
+
+```{r umap}
+N_PCS <- 20   # adjust based on elbow plot
+
+obj <- FindNeighbors(obj, dims = 1:N_PCS, verbose = FALSE)
+obj <- RunUMAP(obj, dims = 1:N_PCS, verbose = FALSE)
+```
+
+```{r umap-umi, fig.cap="UMAP coloured by total UMI. Well-separated lobes indicate distinct transcriptomic identities; colour uniformity within lobes confirms the embedding is not driven by sequencing depth."}
+FeaturePlot(obj, features = "nCount_RNA", pt.size = 0.3) +
+  scale_colour_viridis_c() + ggtitle("UMAP — total UMI / bead")
+```
+
+---
+
+> **MCQ 4 — Dimensionality Reduction**
+>
+> After embedding the ovary transcriptome in UMAP space, one cluster forms a clearly isolated island — consistently separate from all other clusters regardless of resolution. Which cell type most likely occupies this isolated position, and why?
+>
+> A) Theca cells — they surround the follicle and have a unique steroidogenic program
+> B) Stromal fibroblasts — they are the most abundant cell type
+> C) Oocytes — their transcriptome is dominated by a germline maternal mRNA program (*Gdf9*, *Zp3*, *Figla*) with essentially no overlap with somatic cell lineages
+> D) Endothelial cells — they express a vascular program distinct from parenchymal cells
+>
+> **Answer: C** — The oocyte is the only germline-derived cell in the ovary. Its transcriptome is built around maternal mRNA storage and oocyte-specific developmental factors (*Gdf9*, *Zp3*, *Nobox*, *Figla*) that are absent from all somatic lineages. This makes oocytes the most transcriptomically isolated population in any ovarian dataset.
+
+---
+
+## Step 5: Clustering
+
+Clustering groups beads with similar gene expression into discrete clusters that correspond to cell types (or cell states). We use a graph-based approach that scales to large datasets and does not require pre-specifying the number of clusters.
+
+**Method: SNN graph + Louvain community detection**
+A shared-nearest-neighbor (SNN) graph is constructed in PCA space; beads sharing many neighbors receive higher edge weights. The Louvain algorithm maximizes graph modularity to find natural communities. The `resolution` parameter controls granularity — we test several values and select based on biological coherence after annotation.
+
+```{r clustering}
+obj <- FindClusters(obj, resolution = c(0.3, 0.5, 0.8), verbose = FALSE)
+
+# Use resolution 0.5 as working resolution
+Idents(obj) <- "RNA_snn_res.0.5"
+cat(sprintf("Clusters at res 0.5: %d\n", nlevels(Idents(obj))))
+```
+
+```{r cluster-umap, fig.cap="UMAP coloured by cluster (resolution = 0.5). Each numbered cluster will be annotated in Step 6."}
+DimPlot(obj, reduction = "umap", label = TRUE, label.size = 5, pt.size = 0.3) +
+  ggtitle("Clusters — resolution 0.5") + NoLegend()
+```
+
+```{r cluster-spatial, eval=!is.null(obj$x_coord), fig.cap="Clusters mapped onto the tissue section. Spatially coherent clusters validate that transcriptomic communities correspond to real tissue compartments."}
+if (!is.null(obj$x_coord)) {
+  meta       <- obj@meta.data
+  meta$cluster <- Idents(obj)
+  ggplot(meta, aes(x_coord, y_coord, colour = cluster)) +
+    geom_point(size = 0.4) + coord_fixed() + theme_void() +
+    labs(title = "Spatial cluster map", colour = "Cluster") +
+    guides(colour = guide_legend(override.aes = list(size = 3)))
+}
+```
+
+---
+
+> **MCQ 5 — Clustering**
+>
+> After clustering the ovary data, one major tissue compartment consistently resolves into more sub-clusters than the other — even at lower resolution settings. Which compartment shows this greater heterogeneity, and what best explains it?
+>
+> A) Stromal compartment — fibroblasts, smooth muscle, and endothelial cells are indistinguishable from one another
+> B) Follicular compartment (granulosa + cumulus + oocyte) — granulosa cells exist in multiple functional states tied to follicle maturation (preantral, antral, periovulatory, luteinizing), creating several distinct transcriptomic subtypes within a single lineage
+> C) Follicular compartment — the large size of oocytes inflates the cluster count
+> D) Both compartments always produce the same number of clusters
+>
+> **Answer: B** — Mural granulosa cells progress through a continuous developmental trajectory as follicles mature. The PNAS paper identifies at least 4 granulosa subtypes (preantral, antral, atretic, periovulatory/lytic). This developmental heterogeneity creates multiple transcriptomically distinct sub-populations within a single somatic lineage, driving higher cluster counts in the follicular compartment.
+
+---
+
+## Step 6: Cell Typing
+
+We annotate clusters by examining expression of canonical marker genes from the literature and the PNAS paper. This translates computational cluster IDs into biologically interpretable cell type labels.
+
+**Strategy:** Score each bead for a panel of marker genes using `AddModuleScore()`, visualize with `DotPlot()` and `FeaturePlot()`, then assign cell type labels manually.
+
+```{r define-markers}
+# Canonical markers per cell type (from Woad et al. 2024 + established literature)
+cell_markers <- list(
+  Oocyte          = c("Gdf9", "Zp3", "Nobox", "Figla", "Ooep"),
+  Granulosa_mural = c("Foxl2", "Cyp19a1", "Amh", "Inha", "Fshr"),
+  Cumulus         = c("Ptx3", "Has2", "Ptger2", "Tnfaip6"),
+  Theca           = c("Cyp17a1", "Star", "Lhcgr", "Insl3"),
+  Stroma          = c("Dcn", "Col1a1", "Pdgfra", "Vim"),
+  SmoothMuscle    = c("Acta2", "Tagln", "Myl9"),
+  Endothelial     = c("Pecam1", "Cdh5", "Vegfa")
+)
+
+# Filter to genes present in our dataset
+available_markers <- lapply(cell_markers, function(g) intersect(g, rownames(obj)))
+cat("Markers available per cell type:\n")
+print(sapply(available_markers, length))
+```
+
+```{r module-scores}
+# Score each bead for each cell type gene module
+obj <- AddModuleScore(
+  obj,
+  features = available_markers,
+  name     = "Score",
+  seed     = 42
+)
+# Rename score columns for readability
+score_idx  <- seq_along(cell_markers)
+old_names  <- paste0("Score", score_idx)
+new_names  <- paste0("Score_", names(cell_markers))
+idx        <- match(old_names, colnames(obj@meta.data))
+colnames(obj@meta.data)[idx] <- new_names
+```
+
+```{r dotplot, fig.height=6, fig.cap="DotPlot of canonical markers by cluster. Dot size = fraction of beads expressing the gene; colour = scaled average expression. Use this to assign cell type labels to clusters."}
+all_genes <- unique(unlist(available_markers))
+
+DotPlot(obj, features = all_genes, dot.scale = 6) +
+  RotatedAxis() +
+  scale_colour_distiller(palette = "RdYlBu", direction = -1) +
+  labs(title = "Marker gene expression by cluster", x = "Gene", y = "Cluster")
+```
+
+```{r feature-plots, fig.height=8, fig.cap="UMAP expression of one key marker per major cell type. Clear restriction of each marker to a subset of clusters validates the annotation."}
+key_genes <- c("Gdf9", "Foxl2", "Cyp17a1", "Dcn", "Ptx3", "Acta2", "Pecam1")
+key_genes <- intersect(key_genes, rownames(obj))
+
+FeaturePlot(obj, features = key_genes, ncol = 3, pt.size = 0.2, order = TRUE) &
+  scale_colour_viridis_c(option = "C")
+```
+
+```{r annotate}
+# ── Assign cell type labels to clusters ───────────────────────────────────────
+# UPDATE the mapping below based on the DotPlot and FeaturePlot above.
+# Format: "cluster_number" = "CellType"
+
+cluster_annotation <- c(
+  "0" = "Granulosa_mural",
+  "1" = "Stroma",
+  "2" = "Granulosa_mural",
+  "3" = "Theca",
+  "4" = "Cumulus",
+  "5" = "Oocyte",
+  "6" = "SmoothMuscle",
+  "7" = "Endothelial",
+  "8" = "Stroma"
+)
+
+current_clusters <- as.character(Idents(obj))
+obj$cell_type <- ifelse(
+  current_clusters %in% names(cluster_annotation),
+  cluster_annotation[current_clusters],
+  paste0("Unknown_", current_clusters)
+)
+Idents(obj) <- "cell_type"
+```
+
+```{r annotated-umap, fig.cap="UMAP with annotated cell type labels."}
+DimPlot(obj, reduction = "umap", group.by = "cell_type",
+        label = TRUE, label.size = 4, pt.size = 0.3, repel = TRUE) +
+  ggtitle("Cell Type Annotation") + NoLegend()
+```
+
+```{r annotated-spatial, eval=!is.null(obj$x_coord), fig.cap="Spatial distribution of annotated cell types."}
+if (!is.null(obj$x_coord)) {
+  meta <- obj@meta.data
+  ggplot(meta, aes(x_coord, y_coord, colour = cell_type)) +
+    geom_point(size = 0.4) + coord_fixed() + theme_void() +
+    labs(title = "Spatial cell type map", colour = "Cell type") +
+    guides(colour = guide_legend(override.aes = list(size = 3)))
+}
+```
+
+---
+
+> **MCQ 6 — Cell Typing**
+>
+> One cluster uniquely co-expresses *Cyp17a1* (a cytochrome P450 enzyme in androgen biosynthesis) and *Lhcgr* (the LH/hCG receptor). Which cell type does this represent, and why is this co-expression physiologically critical?
+>
+> A) Granulosa (mural) — they convert androgens to estrogen and carry the LH receptor to respond to the preovulatory surge
+> B) Theca cells — they synthesize androgens (*Cyp17a1*) under LH stimulation (*Lhcgr*), supplying the substrate that granulosa cells aromatize into estrogen: the "two-cell, two-gonadotrophin" model of estrogen production
+> C) Cumulus cells — they surround the oocyte and express steroidogenic enzymes to support oocyte maturation
+> D) Oocytes — they direct steroidogenesis in surrounding somatic cells through paracrine factors
+>
+> **Answer: B** — This is the textbook *two-cell two-gonadotrophin* model: LH acts on theca cells (via *Lhcgr*) to drive androgen synthesis (*Cyp17a1* → androstenedione); FSH acts on granulosa cells to aromatize those androgens into estradiol (via *Cyp19a1*). The co-expression of *Cyp17a1* and *Lhcgr* is the definitive molecular signature of theca cell identity.
+
+---
+
+## Step 7: Differential Expression
+
+DE analysis identifies genes significantly up-regulated in each cell type compared to all others, revealing the molecular programs that define each lineage and providing validation of the annotation.
+
+**Method: Wilcoxon rank-sum test**
+A non-parametric test that ranks normalized expression values and compares the rank distribution between groups. Preferred for single-cell data because it is robust to the zero-inflated, non-normal count distributions typical of sparse UMI matrices. No variance homogeneity assumptions are needed.
+
+**Filters:** `min.pct = 0.25` (gene detected in ≥25% of either group) and `logfc.threshold = 0.25` (minimum log2 fold-change to report).
+
+```{r de}
+Idents(obj) <- "cell_type"
+
+de_markers <- FindAllMarkers(
+  obj,
+  test.use        = "wilcox",
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25,
+  verbose         = FALSE
+)
+
+# Top 5 DE genes per cell type by log2FC
+top5 <- de_markers |>
+  group_by(cluster) |>
+  slice_max(order_by = avg_log2FC, n = 5) |>
+  ungroup()
+
+print(top5[, c("cluster", "gene", "avg_log2FC", "p_val_adj")])
+```
+
+```{r de-heatmap, fig.height=7, fig.cap="Heatmap of top 5 DE genes per cell type. Each column = one bead, grouped by cell type. Gene expression restricted to the expected cell types confirms annotation quality."}
+top_genes <- top5 |> pull(gene) |> unique() |> intersect(rownames(obj))
+
+DoHeatmap(
+  obj,
+  features = top_genes,
+  group.by = "cell_type",
+  angle    = 45,
+  size     = 3
+) + scale_fill_viridis_c(option = "D") +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+```{r de-violin, fig.height=5, fig.cap="Top 2 DE markers for the three most transcriptomically dynamic cell types."}
+focus_types <- c("Granulosa_mural", "Theca", "Oocyte")
+focus_genes <- de_markers |>
+  filter(cluster %in% focus_types) |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 2) |>
+  pull(gene) |>
+  unique() |>
+  intersect(rownames(obj))
+
+if (length(focus_genes) > 0) {
+  VlnPlot(obj, features = focus_genes, ncol = 3, pt.size = 0) &
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+}
+```
+
+```{r de-counts}
+# Number of significant DE genes per cell type
+de_markers |>
+  filter(p_val_adj < 0.05) |>
+  count(cluster, name = "n_sig_DE") |>
+  arrange(desc(n_sig_DE)) |>
+  knitr::kable(caption = "Significant DE genes (FDR < 5%) per cell type")
+```
+
+---
+
+> **MCQ 7 — Differential Expression**
+>
+> Comparing the number of differentially expressed genes across cell types, one somatic lineage has by far the largest and most functionally coherent DE gene set — spanning steroidogenesis, extracellular matrix remodeling, cell cycle withdrawal, and pro-inflammatory signalling. Based on the biology of ovulation described in the PNAS paper, which cell type shows this, and what event drives it?
+>
+> A) Theca cells — they continuously produce androgens across the estrous cycle and maintain a large, stable DE signature
+> B) Stromal fibroblasts — they form the structural scaffold of the ovary and express the widest variety of extracellular matrix genes
+> C) Mural granulosa cells — the LH surge triggers an immediate and massive transcriptional switch: *Cyp19a1* (aromatase) is downregulated, progesterone synthesis genes (*Star*, *Cyp11a1*, *Hsd3b*) are upregulated, the cell cycle is arrested, and the entire follicle restructures into the corpus luteum
+> D) Cumulus cells — their proximity to the oocyte requires constant sensing of paracrine signals from many different cell types
+>
+> **Answer: C** — Luteinization of mural granulosa cells is the most rapid and extensive transcriptional remodeling event in the adult ovary. In response to the LH surge, granulosa cells simultaneously shut down follicular (estrogenic) gene programs and activate luteal (progestogenic) ones — involving hundreds of DE genes. This is the molecular event that converts a follicle into the hormone-producing corpus luteum.
+
+---
+
+## Summary
+
+```{r summary}
+# Cell type composition
+cell_counts <- table(obj$cell_type)
+top_marker_per_type <- sapply(names(cell_counts), function(ct) {
+  m <- de_markers |> filter(cluster == ct) |> slice_max(avg_log2FC, n = 1) |> pull(gene)
+  if (length(m) == 0) NA_character_ else m[1]
+})
+
+data.frame(
+  CellType  = names(cell_counts),
+  N_beads   = as.integer(cell_counts),
+  Pct       = round(100 * prop.table(cell_counts), 1),
+  TopMarker = top_marker_per_type
+) |>
+  arrange(desc(N_beads)) |>
+  knitr::kable(
+    col.names = c("Cell Type", "Beads (N)", "Beads (%)", "Top Marker"),
+    caption   = "Final cell type composition and top DE marker per type"
+  )
+```
+
+```{r final-umap, fig.cap="Final annotated UMAP — mouse ovary cell type atlas from Curio Seeker 3×3 data."}
+DimPlot(
+  obj,
+  reduction  = "umap",
+  group.by   = "cell_type",
+  label      = TRUE,
+  label.size = 4.5,
+  pt.size    = 0.3,
+  repel      = TRUE
+) + ggtitle("Mouse Ovary — Cell Type Atlas (Curio Seeker 3×3)") +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
