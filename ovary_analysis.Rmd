@@ -73,6 +73,23 @@ The data were generated with the **Curio Seeker 3×3** platform: a bead-based sp
 | Stroma / fibroblast | *Dcn*, *Col1a1*, *Pdgfra* |
 | Smooth muscle | *Acta2*, *Tagln* |
 | Endothelial | *Pecam1*, *Cdh5* |
+| Atretic (apoptotic) | *Casp3*, *Fas*, *Inhbb* |
+
+**Platform context — Curio Seeker 3×3 vs. alternatives:**
+
+| Platform | Resolution | Area / spots | Genes | Notes |
+|---|---|---|---|---|
+| **Curio Seeker 3×3** | **10 µm** | 3×3 mm, ~80 k beads | Whole transcriptome | ~1–2 cells/bead; random bead placement; passive capture |
+| 10x Visium | 55 µm | 6.5×6.5 mm, ~5 k spots | Whole transcriptome | ~10–15 cells/spot; grid layout; H&E image overlay |
+| 10x Xenium / CosMx | Sub-cellular | Flexible | 200–5,000 (targeted) | FISH-based; no library prep; very high cost |
+| Slide-seq v2 | 10 µm | ~3 mm diameter | Whole transcriptome | Similar resolution to Curio; more complex library prep |
+
+Key Curio Seeker technical considerations for this analysis:
+
+- **Random bead placement** — coordinates are irregular (not a grid), so spatial analyses cannot assume uniform spacing.
+- **Empty beads** — many of the ~80 k beads capture no cells; aggressive `min.features` filtering in QC is critical.
+- **Lower UMI/bead than droplet platforms** — passive diffusion capture is less efficient than active encapsulation (10x Chromium). Expect 500–3,000 UMI/bead vs. 2,000–10,000 per cell on Chromium.
+- **Ambient RNA** — lysed cells release mRNA that deposits on neighbouring beads. In a production pipeline this would be addressed with [SoupX](https://github.com/constantAmateur/SoupX) or DecontX prior to QC filtering; for this single-sample analysis we rely on the `percent.mt` and UMI thresholds to indirectly reduce contaminated beads.
 
 ---
 
@@ -336,6 +353,106 @@ LabelPoints(plot = p, points = top15, repel = TRUE, xnudge = 0, ynudge = 0)
 
 ---
 
+## Step 3b: Spatially Variable Genes (SVGs)
+
+HVGs capture *transcriptional* variation across beads regardless of where they sit in the tissue. **Spatially variable genes (SVGs)** go further: they identify genes whose expression is spatially autocorrelated — forming coherent expression domains in the tissue rather than appearing as scattered high-variance noise.
+
+This is the key analytical advantage of spatial over conventional scRNA-seq: spatial structure is informative biology (follicle boundaries, vascular channels, immune niches), not just noise. Moran's I quantifies whether nearby beads tend to express a gene at similar levels (positive autocorrelation = spatially structured) versus randomly.
+
+```{r svg, eval=!is.null(obj$x_coord)}
+# ── Spatially Variable Gene analysis ──────────────────────────────────────────
+# Requires spatial coordinates. Uses a Gaussian kernel weight matrix to score
+# each HVG for spatial autocorrelation (Moran's I statistic).
+# Only runs if spatial coordinates were loaded successfully.
+
+if (!is.null(obj$x_coord)) {
+  # Scale and PCA first (needed for SVG selection in Seurat v5 workflow)
+  obj_svg <- ScaleData(obj, features = VariableFeatures(obj), verbose = FALSE)
+  obj_svg <- RunPCA(obj_svg, features = VariableFeatures(obj_svg),
+                   npcs = 30, verbose = FALSE)
+
+  # Build a simple spatial weight matrix (Gaussian kernel, sigma = 50 µm)
+  # and compute Moran's I for each HVG
+  coords_mat <- as.matrix(obj@meta.data[, c("x_coord", "y_coord")])
+
+  # Euclidean distance matrix (can be slow for >20k beads; sample if needed)
+  n_beads <- nrow(coords_mat)
+  if (n_beads > 5000) {
+    set.seed(42)
+    idx <- sample(n_beads, 5000)
+    coords_sub <- coords_mat[idx, ]
+  } else {
+    idx <- seq_len(n_beads)
+    coords_sub <- coords_mat
+  }
+
+  dist_mat <- as.matrix(dist(coords_sub))
+  sigma     <- 50   # spatial bandwidth in coordinate units (~µm)
+  W         <- exp(-dist_mat^2 / (2 * sigma^2))
+  diag(W)   <- 0
+  W         <- W / rowSums(W)   # row-normalise
+
+  # Compute Moran's I for each HVG on the subsampled beads
+  hvgs <- VariableFeatures(obj)
+  expr_sub <- as.matrix(
+    GetAssayData(obj, layer = "data")[hvgs, colnames(obj)[idx]]
+  )
+
+  moran_i <- apply(expr_sub, 1, function(x) {
+    xc <- x - mean(x)
+    n  <- length(x)
+    denom <- sum(xc^2)
+    if (denom == 0) return(NA_real_)
+    (n / sum(W)) * (as.numeric(xc %*% W %*% xc) / denom)
+  })
+
+  svg_df <- data.frame(
+    gene    = hvgs,
+    moran_i = moran_i
+  ) |>
+    filter(!is.na(moran_i)) |>
+    arrange(desc(moran_i))
+
+  cat("Top 10 spatially variable genes (by Moran's I):\n")
+  print(head(svg_df, 10))
+}
+```
+
+```{r svg-plots, eval=!is.null(obj$x_coord), fig.height=8, fig.cap="Spatial expression of the top 6 SVGs. Genes with high Moran's I form coherent expression domains corresponding to tissue compartments — follicle layers, stroma, vasculature — rather than random scatter."}
+if (!is.null(obj$x_coord) && exists("svg_df")) {
+  top_svgs <- head(svg_df$gene, 6)
+  top_svgs <- intersect(top_svgs, rownames(obj))
+
+  meta <- obj@meta.data
+  plots <- lapply(top_svgs, function(g) {
+    expr <- GetAssayData(obj, layer = "data")[g, ]
+    meta$expr <- expr
+    ggplot(meta, aes(x_coord, y_coord, colour = expr)) +
+      geom_point(size = 0.25) +
+      scale_colour_viridis_c(option = "C") +
+      coord_fixed() + theme_void() +
+      labs(title = g, colour = "log-norm")
+  })
+
+  patchwork::wrap_plots(plots, ncol = 3)
+}
+```
+
+---
+
+> **MCQ 3b — Spatially Variable Genes**
+>
+> HVG analysis and SVG analysis both rank genes by how much they vary across the dataset. What is the fundamental difference between a gene that is merely "highly variable" and one that is "spatially variable" in this ovary section?
+>
+> A) SVGs have higher average expression than HVGs
+> B) A spatially variable gene shows expression that is autocorrelated with physical location — nearby beads tend to share similar expression values — forming biologically meaningful tissue domains, whereas a plain HVG can vary randomly across the slide without spatial structure
+> C) SVGs are restricted to the top 200 most expressed genes per cluster
+> D) HVGs and SVGs are identical; the terms are interchangeable in spatial analysis
+>
+> **Answer: B** — Spatial autocorrelation (Moran's I) measures whether a gene's expression in one bead predicts expression in its physical neighbors. High Moran's I genes delineate real tissue compartments: a follicle boundary gene will be high in all beads inside the follicle and low outside, creating a spatially coherent patch. A plain HVG might vary stochastically across beads with no geographic pattern — informative for cell typing but not for tissue architecture.
+
+---
+
 ## Step 4: Dimensionality Reduction
 
 Even 2,000 genes form a high-dimensional space where distances are hard to interpret. Dimensionality reduction compresses this into a low-dimensional summary that preserves the most important structure.
@@ -450,7 +567,8 @@ cell_markers <- list(
   Theca           = c("Cyp17a1", "Star", "Lhcgr", "Insl3"),
   Stroma          = c("Dcn", "Col1a1", "Pdgfra", "Vim"),
   SmoothMuscle    = c("Acta2", "Tagln", "Myl9"),
-  Endothelial     = c("Pecam1", "Cdh5", "Vegfa")
+  Endothelial     = c("Pecam1", "Cdh5", "Vegfa"),
+  Atretic         = c("Casp3", "Fas", "Inhbb", "Bnip3")   # apoptotic / atretic follicle cells
 )
 
 # Filter to genes present in our dataset
@@ -507,6 +625,7 @@ cluster_annotation <- c(
   "6" = "SmoothMuscle",
   "7" = "Endothelial",
   "8" = "Stroma"
+  # Add "9" = "Atretic" etc. based on DotPlot above — look for Casp3/Fas co-expression
 )
 
 current_clusters <- as.character(Idents(obj))
@@ -531,6 +650,72 @@ if (!is.null(obj$x_coord)) {
     geom_point(size = 0.4) + coord_fixed() + theme_void() +
     labs(title = "Spatial cell type map", colour = "Cell type") +
     guides(colour = guide_legend(override.aes = list(size = 3)))
+}
+```
+
+### Spatial Cell-Type Co-localization
+
+In a UMAP or DotPlot, cell types are compared transcriptomically. Spatial co-localization asks a complementary question: **which cell types are physically adjacent in the tissue?** This is a direct readout of tissue architecture and validates annotations using spatial logic rather than transcriptomic similarity.
+
+For the mouse ovary, we expect a concentric follicle structure:
+oocyte → cumulus → mural granulosa → theca
+
+Each cell type should be most enriched in the spatial neighborhood of the expected adjacent type.
+
+```{r spatial-coloc, eval=!is.null(obj$x_coord), fig.height=5, fig.cap="Spatial cell-type co-localization matrix. Each cell (row = focal type, column = neighbor type) shows the fraction of spatial k-nearest neighbors (k = 10) belonging to each annotated cell type. The expected concentric follicle structure — oocyte surrounded by cumulus, cumulus by granulosa, granulosa by theca — should be visible as an off-diagonal enrichment pattern."}
+if (!is.null(obj$x_coord)) {
+  meta <- obj@meta.data
+  ct   <- meta$cell_type
+  coords_all <- as.matrix(meta[, c("x_coord", "y_coord")])
+
+  # For speed: subsample to max 8,000 beads if dataset is large
+  n_total <- nrow(coords_all)
+  if (n_total > 8000) {
+    set.seed(42)
+    sub_idx <- sample(n_total, 8000)
+  } else {
+    sub_idx <- seq_len(n_total)
+  }
+
+  coords_sub2 <- coords_all[sub_idx, ]
+  ct_sub      <- ct[sub_idx]
+  ct_levels   <- sort(unique(ct_sub))
+
+  # Build spatial kNN (k = 10) using a simple Euclidean distance approach
+  # (avoids external package dependency)
+  k <- 10
+  coloc_mat <- matrix(0, nrow = length(ct_levels), ncol = length(ct_levels),
+                      dimnames = list(ct_levels, ct_levels))
+
+  # Batch kNN: for each focal bead, find k nearest neighbors
+  dist_sq <- function(a, B) rowSums(sweep(B, 2, a, "-")^2)
+
+  for (i in seq_along(sub_idx)) {
+    dists  <- dist_sq(coords_sub2[i, ], coords_sub2[-i, ])
+    nn_idx <- order(dists)[seq_len(k)]
+    nn_cts <- ct_sub[-i][nn_idx]
+    focal  <- ct_sub[i]
+    for (nc in nn_cts) {
+      coloc_mat[focal, nc] <- coloc_mat[focal, nc] + 1
+    }
+  }
+
+  # Row-normalise to fractions
+  coloc_frac <- sweep(coloc_mat, 1, rowSums(coloc_mat), "/")
+
+  # Melt and plot
+  coloc_df <- as.data.frame(as.table(coloc_frac))
+  colnames(coloc_df) <- c("focal", "neighbor", "fraction")
+
+  ggplot(coloc_df, aes(neighbor, focal, fill = fraction)) +
+    geom_tile(colour = "white") +
+    scale_fill_viridis_c(option = "B", labels = scales::percent_format(1)) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = "Spatial cell-type co-localization (k = 10 nearest neighbors)",
+      x = "Neighbor cell type", y = "Focal cell type", fill = "Fraction"
+    )
 }
 ```
 
