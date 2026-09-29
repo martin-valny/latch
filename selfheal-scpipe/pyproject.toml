@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "healpipe"
+version = "0.1.0"
+description = "Self-healing single-cell pipeline: monitor checks, fault injection, and an LLM recovery agent with deterministic tools."
+requires-python = ">=3.10"
+dependencies = [
+  "anndata>=0.10",
+  "scanpy>=1.10",
+  "numpy",
+  "scipy",
+  "pandas",
+  "anthropic>=1.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+healpipe = "healpipe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+filterwarnings = ["ignore::FutureWarning", "ignore::UserWarning"]
